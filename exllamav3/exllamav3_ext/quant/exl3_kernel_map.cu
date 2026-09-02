@@ -83,11 +83,53 @@ int exl3_gemm_tilesize_k[] = {EXL3_GEMM_TILESIZE_K};
 int exl3_gemm_tilesize_n[] = {EXL3_GEMM_TILESIZE_N};
 int exl3_gemm_blockdim[] = {EXL3_GEMM_BLOCKDIM};
 
+// Shared memory a shape/bitrate instantiation needs, mirroring the layout computed in
+// exl3_gemm_kernel_inner (sh_a and sh_b staged SH_STAGES deep, then the fp32 sh_c region).
+// Kept in sync with the static_assert there; used to reject shapes that exceed what a
+// device can actually give a block, which on Turing is 64 KB rather than 90.
+static const int exl3_gemm_sh_stages[] = {0, 6, 4, 4, 4};
+
+int exl3_gemm_shape_smem(int shape_idx, int K)
+{
+    const int TILESIZE_M = 16;
+    int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
+    int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
+    int sh_stages = exl3_gemm_sh_stages[shape_idx];
+
+    int sh_a_stage_size = TILESIZE_M * tilesize_k;                              // halfs
+    int sh_b_stage_size = (tilesize_k / 16) * (tilesize_n / 16) * 256 / 16 * K; // uint16s
+    int frags_n_per_warp = 2 * (tilesize_n / 16) / (EXL3_GEMM_BASE_THREADS / 32);
+    int sh_c_size = MAX(4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp,          // floats
+                        tilesize_n * TILESIZE_M);
+
+    return sh_stages * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size;
+}
+
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int K)
 {
     int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
     int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
-    return (size_k % tilesize_k == 0) && (size_n % tilesize_n == 0);
+    if (size_k % tilesize_k || size_n % tilesize_n) return false;
+
+    // Device-dependent: callers with tensors on a non-current device must set a device guard
+    // first (every in-tree caller runs under OptionalCUDAGuard). Only matters on a mixed-arch
+    // host, where a 90 KB-capable device would otherwise vouch for a 64 KB one.
+    int device;
+    cudaGetDevice(&device);
+    return exl3_gemm_shape_smem(shape_idx, K) <= DevCtx::instance().get_smem_request(device);
+}
+
+// Hard gate for explicitly forced shapes, which skip the autotuner's shape_compat filter.
+// Launching a shape whose static layout exceeds what the launch can request would read past
+// the end of the extern __shared__ block - silent corruption rather than a failed launch.
+void exl3_gemm_check_smem(int shape_idx, int K, const char* who)
+{
+    int device;
+    cudaGetDevice(&device);
+    int need = exl3_gemm_shape_smem(shape_idx, K);
+    int have = DevCtx::instance().get_smem_request(device);
+    TORCH_CHECK(need <= have, who, ": shape ", shape_idx, " at ", K,
+                " bpw needs ", need, " B of shared memory, device provides ", have);
 }
 
 // Instance tables, [K][cb] -> array indexed by shape_idx. Row 0 unused (no K = 0 instances)
@@ -147,6 +189,7 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, K, false, 1, 1) : force_shape_idx;
 
     TORCH_CHECK(shape_idx > 0, "exl3_gemm: no compatible kernel");
+    exl3_gemm_check_smem(shape_idx, K, "exl3_gemm");
     if (out_shape_idx) *out_shape_idx = shape_idx;
     if (out_block_dim) *out_block_dim = exl3_gemm_blockdim[shape_idx];
 
@@ -182,6 +225,7 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
 {
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, K, true, bszm_in, bszm_out) : force_shape_idx;
     TORCH_CHECK(shape_idx > 0, "exl3_mgemm: no compatible kernel");
+    exl3_gemm_check_smem(shape_idx, K, "exl3_mgemm");
     if (out_shape_idx) *out_shape_idx = shape_idx;
     if (out_block_dim) *out_block_dim = exl3_gemm_blockdim[shape_idx];
 

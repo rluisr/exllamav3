@@ -24,6 +24,89 @@ except ImportError:
 
 from .common import AttnArgs, get_non_causal_span_arglist
 
+_decode_sm_count = {}
+_smem_limit = {}
+_small_smem = {}
+
+
+def _dev_small_smem(device) -> bool:
+    """True on devices whose shared memory is too small for the stock Triton tile configs.
+
+    Gated on compute capability rather than a byte threshold: the configs are sized for the
+    ~99 KB that sm_80 and later report, and every pre-Ampere part is materially below that
+    (Turing 64 KB, Volta 96 KB). A byte comparison would have to sit within a few KB of the
+    real Ampere value to separate them, which makes it fragile against exactly the parts it
+    is meant to classify.
+    """
+    dev = device.index if hasattr(device, "index") else device
+    if dev not in _small_smem:
+        _small_smem[dev] = torch.cuda.get_device_capability(dev)[0] < 8
+    return _small_smem[dev]
+
+
+def _dev_smem_limit(device) -> int:
+    """Usable dynamic shared memory per block, cached per device.
+
+    The Triton tile configs below are sized for the ~100 KB that Ampere and later provide.
+    Turing provides 64 KB, and Triton does not degrade gracefully: exceeding the limit raises
+    OutOfResources at launch rather than recompiling smaller. Configs therefore have to be
+    chosen against the real limit up front.
+
+    Queried through the extension rather than torch: get_device_properties() only grew a
+    shared-memory attribute in recent versions (absent in 2.6), and the extension already
+    asks the driver for cudaDevAttrMaxSharedMemoryPerBlockOptin. Falls back to the compute
+    capability, which fixes the limit for every architecture the library supports.
+    """
+    dev = device.index
+    if dev not in _smem_limit:
+        try:
+            from ...ext import exllamav3_ext as ext
+            limit = ext.g_get_smem_max(dev)
+        except (ImportError, AttributeError):
+            major = torch.cuda.get_device_capability(device)[0]
+            limit = 64 * 1024 if major < 8 else 96 * 1024
+        _smem_limit[dev] = limit
+    return _smem_limit[dev]
+
+
+def _oom_is_smem(e: BaseException) -> bool:
+    """True for Triton's shared-memory OutOfResources, which is recoverable by re-dispatch.
+
+    The tile configs are pre-shrunk for small-smem devices, but that reasoning is per-kernel
+    and cannot cover every geometry a caller might present. Treating this one error as a
+    dispatch miss lets the attention dispatcher fall through to the next backend (SDPA,
+    xformers) instead of aborting the forward pass. Any other error still propagates.
+    """
+    if not has_triton:
+        return False
+    from triton.runtime.errors import OutOfResources
+    return isinstance(e, OutOfResources) and "shared memory" in str(e)
+
+
+def _smem_fallback(fn):
+    """Turn a shared-memory OutOfResources into a dispatch miss (None).
+
+    attn_dispatch treats None as 'this backend does not handle these arguments' and moves on
+    to the next candidate, so a Triton kernel that will not fit degrades to a slower backend
+    instead of killing the forward pass. Applied to the dispatcher entry points only, so
+    direct callers still see the original error.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(args):
+        try:
+            return fn(args)
+        except Exception as e:
+            if _oom_is_smem(e):
+                return None
+            raise
+
+    return wrapper
+
+
+
+
 
 def _is_power_of_2(x: int) -> bool:
     return x > 0 and (x & (x - 1)) == 0
@@ -639,6 +722,7 @@ def paged_attn_triton_longq(
     return out
 
 
+@_smem_fallback
 def fn_triton_paged_attn(args: AttnArgs) -> torch.Tensor | None:
     if (
         not has_triton or
@@ -668,6 +752,7 @@ def fn_triton_paged_attn(args: AttnArgs) -> torch.Tensor | None:
     )
 
 
+@_smem_fallback
 def fn_triton_paged_attn_longq(args: AttnArgs) -> torch.Tensor | None:
     if (
         not has_triton or
@@ -1054,8 +1139,6 @@ def _paged_attn_decode_combine_kernel(
     tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None])
 
 
-_decode_sm_count = {}
-
 def paged_attn_triton_decode(
     q: torch.Tensor,
     k: torch.Tensor | None,
@@ -1200,6 +1283,7 @@ def paged_attn_triton_decode(
     return out
 
 
+@_smem_fallback
 def fn_triton_paged_attn_decode(args: AttnArgs) -> torch.Tensor | None:
     if (
         not has_triton or
@@ -1783,6 +1867,12 @@ def paged_attn_triton_prefill(
         cfg = (64, 32, 8, 2)
     else:
         cfg = (32, 16, 4, 2)
+    # Turing only offers 64 KB, so the stock tiles overcommit by ~50%. Halving the q tile
+    # halves the staged bytes and keeps the kv tile (and thus the inner-loop shape) intact,
+    # which costs occupancy but not correctness. Triton raises rather than shrinking on its
+    # own, so this has to be decided before the launch.
+    if _dev_small_smem(q.device):
+        cfg = (max(16, cfg[0] // 2), cfg[1], cfg[2], cfg[3])
     num_stages_forced = num_stages is not None
     block_m = block_m or cfg[0]
     block_n = block_n or cfg[1]
@@ -1889,6 +1979,7 @@ def paged_attn_triton_prefill(
     return out
 
 
+@_smem_fallback
 def fn_triton_attn_nocache(args: AttnArgs) -> torch.Tensor | None:
     """Non-cached attention through the prefill kernel's direct-kv source (NEW_KV=2)."""
     if (
@@ -1917,6 +2008,7 @@ def fn_triton_attn_nocache(args: AttnArgs) -> torch.Tensor | None:
     )
 
 
+@_smem_fallback
 def fn_triton_paged_attn_prefill(args: AttnArgs) -> torch.Tensor | None:
     if (
         not has_triton or
@@ -2141,6 +2233,7 @@ def varlen_attn_triton(
     return out.unsqueeze(0) if squeeze else out
 
 
+@_smem_fallback
 def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
     if (
         not has_triton or
@@ -2167,6 +2260,7 @@ def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
     )
 
 
+@_smem_fallback
 def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
     if (
         args.q_cache is None or
@@ -2195,6 +2289,7 @@ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
     )
 
 
+@_smem_fallback
 def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
     if (
         args.q_cache is None or
